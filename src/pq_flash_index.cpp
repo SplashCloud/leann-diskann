@@ -68,6 +68,16 @@ struct DiskannHopTraceEvent
     std::vector<uint32_t> cached_frontier;
 };
 
+struct DiskannZmqFetchProfile
+{
+    float total_us = 0.0f;
+    float serialize_us = 0.0f;
+    float socket_setup_us = 0.0f;
+    float send_us = 0.0f;
+    float recv_us = 0.0f;
+    float parse_us = 0.0f;
+};
+
 static bool diskann_trace_enabled()
 {
     const char *env = std::getenv("LEANN_DISKANN_TRACE");
@@ -1645,8 +1655,10 @@ struct ZmqContextManager
 static ZmqContextManager g_zmq_manager;
 
 bool fetch_embeddings_zmq(const std::vector<uint32_t> &node_ids, std::vector<std::vector<float>> &out_embeddings,
-                          int zmq_port)
+                          int zmq_port, DiskannZmqFetchProfile *profile = nullptr)
 {
+    Timer total_timer;
+    Timer stage_timer;
     // 1. Protobuf 序列化：创建请求消息
     protoembedding::NodeEmbeddingRequest req_proto;
     for (const auto id : node_ids)
@@ -1658,6 +1670,10 @@ bool fetch_embeddings_zmq(const std::vector<uint32_t> &node_ids, std::vector<std
     {
         std::cerr << "ZMQ_FETCH_ERROR: Failed to serialize NodeEmbeddingRequest.\n";
         return false;
+    }
+    if (profile != nullptr)
+    {
+        profile->serialize_us = (float)stage_timer.elapsed();
     }
 
     // 2. Use thread-local (thread_local) Socket for connection reuse
@@ -1678,6 +1694,7 @@ bool fetch_embeddings_zmq(const std::vector<uint32_t> &node_ids, std::vector<std
     } cleanup;
 
     // If current thread's Socket is not created, initialize and connect
+    stage_timer.reset();
     if (tl_socket == nullptr)
     {
         // Create Socket from global Context
@@ -1689,8 +1706,10 @@ bool fetch_embeddings_zmq(const std::vector<uint32_t> &node_ids, std::vector<std
         }
 
         int timeout = 300000; // 300 seconds timeout, same as embedding server
+        int linger = 0;
         zmq_setsockopt(tl_socket, ZMQ_RCVTIMEO, &timeout, sizeof(timeout));
         zmq_setsockopt(tl_socket, ZMQ_SNDTIMEO, &timeout, sizeof(timeout));
+        zmq_setsockopt(tl_socket, ZMQ_LINGER, &linger, sizeof(linger));
 
         std::string endpoint = "tcp://127.0.0.1:" + std::to_string(zmq_port);
         if (zmq_connect(tl_socket, endpoint.c_str()) != 0)
@@ -1702,8 +1721,13 @@ bool fetch_embeddings_zmq(const std::vector<uint32_t> &node_ids, std::vector<std
             return false;
         }
     }
+    if (profile != nullptr)
+    {
+        profile->socket_setup_us = (float)stage_timer.elapsed();
+    }
 
     // 3. Send request using established connection
+    stage_timer.reset();
     if (zmq_send(tl_socket, req_str.data(), req_str.size(), 0) < 0)
     {
         std::cerr << "ZMQ_FETCH_ERROR: zmq_send() failed: " << zmq_strerror(zmq_errno()) << "\n";
@@ -1711,12 +1735,17 @@ bool fetch_embeddings_zmq(const std::vector<uint32_t> &node_ids, std::vector<std
         tl_socket = nullptr;  // Reset, force next rebuild
         return false;
     }
+    if (profile != nullptr)
+    {
+        profile->send_us = (float)stage_timer.elapsed();
+    }
 
     // 4. Receive response
     zmq_msg_t response_msg;
     zmq_msg_init(&response_msg);
     bool success = true;
 
+    stage_timer.reset();
     if (zmq_msg_recv(&response_msg, tl_socket, 0) < 0)
     {
         std::cerr << "ZMQ_FETCH_ERROR: zmq_msg_recv() failed: " << zmq_strerror(zmq_errno()) << "\n";
@@ -1726,7 +1755,12 @@ bool fetch_embeddings_zmq(const std::vector<uint32_t> &node_ids, std::vector<std
     }
     else
     {
+        if (profile != nullptr)
+        {
+            profile->recv_us = (float)stage_timer.elapsed();
+        }
         // 5. Protobuf deserialization and extract data
+        stage_timer.reset();
         protoembedding::NodeEmbeddingResponse resp_proto;
         if (!resp_proto.ParseFromArray(zmq_msg_data(&response_msg), static_cast<int>(zmq_msg_size(&response_msg))))
         {
@@ -1769,11 +1803,19 @@ bool fetch_embeddings_zmq(const std::vector<uint32_t> &node_ids, std::vector<std
                 success = false;
             }
         }
+        if (profile != nullptr)
+        {
+            profile->parse_us = (float)stage_timer.elapsed();
+        }
     }
 
     // 6. Clean up message object, but keep Socket and Context open for next reuse
     zmq_msg_close(&response_msg);
 
+    if (profile != nullptr)
+    {
+        profile->total_us = (float)total_timer.elapsed();
+    }
     return success;
 }
 
@@ -1781,10 +1823,10 @@ bool fetch_embeddings_zmq(const std::vector<uint32_t> &node_ids, std::vector<std
  * fetch_embeddings_http: Function for backward compatibility, now uses ZMQ exclusively
  */
 bool fetch_embeddings_http(const std::vector<uint32_t> &node_ids, std::vector<std::vector<float>> &out_embeddings,
-                           int zmq_port)
+                           int zmq_port, DiskannZmqFetchProfile *profile = nullptr)
 {
     // Use ZMQ implementation exclusively
-    return fetch_embeddings_zmq(node_ids, out_embeddings, zmq_port);
+    return fetch_embeddings_zmq(node_ids, out_embeddings, zmq_port, profile);
 }
 
 //! Should be aligned with utils.h::prepare_base_for_inner_products
@@ -1863,6 +1905,9 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
     if (beam_width > num_sector_per_nodes * defaults::MAX_N_SECTOR_READS)
         throw ANNException("Beamwidth can not be higher than defaults::MAX_N_SECTOR_READS", -1, __FUNCSIG__, __FILE__,
                            __LINE__);
+
+    Timer profile_total_timer;
+    Timer profile_stage_timer;
 
     ScratchStoreManager<SSDThreadData<T>> manager(this->_thread_data);
     auto data = manager.scratch_space();
@@ -2187,6 +2232,21 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
     uint64_t profile_recompute_batches = 0;
     float profile_deferred_fetch_us = 0.0f;
     float profile_deferred_distance_us = 0.0f;
+    float profile_setup_us = (float)profile_stage_timer.elapsed();
+    float profile_medoid_us = 0.0f;
+    float profile_traversal_total_us = 0.0f;
+    float profile_traversal_frontier_select_us = 0.0f;
+    float profile_traversal_io_us = 0.0f;
+    float profile_traversal_cached_expand_us = 0.0f;
+    float profile_traversal_frontier_expand_us = 0.0f;
+    float profile_traversal_prune_us = 0.0f;
+    float profile_traversal_pq_distance_us = 0.0f;
+    float profile_traversal_heap_update_us = 0.0f;
+    float profile_traversal_trace_us = 0.0f;
+    float profile_postprocess_sort_us = 0.0f;
+    float profile_postprocess_reorder_us = 0.0f;
+    float profile_result_copy_us = 0.0f;
+    DiskannZmqFetchProfile profile_deferred_zmq;
     std::unordered_map<uint32_t, size_t> profile_event_by_node;
     std::unordered_map<uint32_t, float> profile_exact_by_node;
 
@@ -2200,6 +2260,7 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
     std::vector<std::vector<float>> exact_embeddings;
 #endif
 
+    profile_stage_timer.reset();
     uint32_t best_medoid = 0;
     float best_dist = (std::numeric_limits<float>::max)();
     if (!use_filter)
@@ -2242,6 +2303,7 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
     compute_dists(&best_medoid, 1, dist_scratch);
     retset.insert(Neighbor(best_medoid, dist_scratch[0]));
     visited.insert(best_medoid);
+    profile_medoid_us = (float)profile_stage_timer.elapsed();
 
     uint32_t cmps = 0;
     uint32_t hops = 0;
@@ -2264,10 +2326,12 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
     }
     auto record_candidate_trace = [&](uint32_t hop_id, int64_t parent_id, uint32_t *node_nbrs, uint64_t nnbrs,
                                       float *dists, bool selected_for_recompute) {
+        Timer trace_timer;
         profile_candidates_seen += nnbrs;
         profile_candidate_events_total += nnbrs;
         if (!trace_enabled || nnbrs == 0)
         {
+            profile_traversal_trace_us += (float)trace_timer.elapsed();
             return;
         }
         std::vector<uint64_t> order(nnbrs);
@@ -2301,8 +2365,10 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
             candidate_trace.push_back(event);
             profile_candidate_events_recorded++;
         }
+        profile_traversal_trace_us += (float)trace_timer.elapsed();
     };
 
+    Timer traversal_timer;
     while (retset.has_unexpanded_node() && num_ios < io_limit)
     {
         // clear iteration state
@@ -2312,6 +2378,7 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
         cached_nhoods.clear();
         sector_scratch_idx = 0;
         // find new beam
+        profile_stage_timer.reset();
         uint32_t num_seen = 0;
         while (retset.has_unexpanded_node() && frontier.size() < beam_width && num_seen < beam_width)
         {
@@ -2335,6 +2402,7 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                 reinterpret_cast<std::atomic<uint32_t> &>(this->_node_visit_counter[nbr.id].second).fetch_add(1);
             }
         }
+        profile_traversal_frontier_select_us += (float)profile_stage_timer.elapsed();
         if (trace_enabled && hop_trace.size() < trace_limit)
         {
             DiskannHopTraceEvent hop_event;
@@ -2454,13 +2522,16 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                 graph_reader->read(graph_read_reqs, ctx);
             }
 
+            auto io_elapsed = (float)io_timer.elapsed();
+            profile_traversal_io_us += io_elapsed;
             if (stats != nullptr)
             {
-                stats->io_us += (float)io_timer.elapsed();
+                stats->io_us += io_elapsed;
             }
         }
 
         // process cached nhoods
+        profile_stage_timer.reset();
         for (auto &cached_nhood : cached_nhoods)
         {
             auto global_cache_iter = _coord_cache.find(cached_nhood.first);
@@ -2514,15 +2585,18 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
             // compute node_nbrs <-> query dists in PQ space
             cpu_timer.reset();
             compute_dists(node_nbrs, nnbrs, dist_scratch);
+            auto pq_elapsed = (float)cpu_timer.elapsed();
+            profile_traversal_pq_distance_us += pq_elapsed;
             record_candidate_trace(hops, static_cast<int64_t>(node_id), node_nbrs, nnbrs, dist_scratch,
                                    recompute_beighbor_embeddings);
             if (stats != nullptr)
             {
                 stats->n_cmps += (uint32_t)nnbrs;
-                stats->cpu_us += (float)cpu_timer.elapsed();
+                stats->cpu_us += pq_elapsed;
             }
 
             // process prefetched nhood
+            Timer heap_timer;
             for (uint64_t m = 0; m < nnbrs; ++m)
             {
                 uint32_t id = node_nbrs[m];
@@ -2540,7 +2614,9 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                     retset.insert(nn);
                 }
             }
+            profile_traversal_heap_update_us += (float)heap_timer.elapsed();
         }
+        profile_traversal_cached_expand_us += (float)profile_stage_timer.elapsed();
 #ifdef USE_BING_INFRA
         // process each frontier nhood - compute distances to unvisited nodes
         int completedIndex = -1;
@@ -2555,6 +2631,7 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
 #else
         std::vector<uint32_t> batched_node_ids;
 
+        profile_stage_timer.reset();
         for (auto &frontier_nhood : frontier_nhoods)
         {
 #endif
@@ -2711,17 +2788,22 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
 
             if (!batch_recompute)
             {
+                Timer prune_timer;
                 prune_node_nbrs(node_nbrs, nnbrs);
+                profile_traversal_prune_us += (float)prune_timer.elapsed();
                 compute_dists(node_nbrs, nnbrs, dist_scratch);
+                auto pq_elapsed = (float)cpu_timer.elapsed();
+                profile_traversal_pq_distance_us += pq_elapsed;
                 record_candidate_trace(hops, static_cast<int64_t>(node_id), node_nbrs, nnbrs, dist_scratch,
                                        recompute_beighbor_embeddings);
                 if (stats != nullptr)
                 {
                     stats->n_cmps += (uint32_t)nnbrs;
-                    stats->cpu_us += (float)cpu_timer.elapsed();
+                    stats->cpu_us += pq_elapsed;
                 }
 
                 cpu_timer.reset();
+                Timer heap_timer;
                 // process prefetch-ed nhood
                 for (uint64_t m = 0; m < nnbrs; ++m)
                 {
@@ -2745,6 +2827,7 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                         retset.insert(nn);
                     }
                 }
+                profile_traversal_heap_update_us += (float)heap_timer.elapsed();
 
                 if (stats != nullptr)
                 {
@@ -2762,13 +2845,18 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
         {
             uint64_t nnbrs = static_cast<uint64_t>(batched_node_ids.size());
             uint32_t *batched_data_ptr = batched_node_ids.data(); // Get pointer to data
+            Timer prune_timer;
             prune_node_nbrs(batched_data_ptr, nnbrs);             // Prune using the pointer, nnbrs is updated
+            profile_traversal_prune_us += (float)prune_timer.elapsed();
 
+            cpu_timer.reset();
             compute_dists(batched_data_ptr, nnbrs, batched_dists); // Compute dists for the pruned set
+            profile_traversal_pq_distance_us += (float)cpu_timer.elapsed();
             record_candidate_trace(hops, -1, batched_data_ptr, nnbrs, batched_dists, recompute_beighbor_embeddings);
             // ! Not sure if dist_scratch has enough space
 
             // process prefetch-ed nhood
+            Timer heap_timer;
             for (uint64_t m = 0; m < nnbrs; ++m)
             {
                 uint32_t id = batched_node_ids[m];
@@ -2791,11 +2879,14 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                     retset.insert(nn);
                 }
             }
+            profile_traversal_heap_update_us += (float)heap_timer.elapsed();
         }
+        profile_traversal_frontier_expand_us += (float)profile_stage_timer.elapsed();
         // }
         // }
         hops++;
     }
+    profile_traversal_total_us = (float)traversal_timer.elapsed();
 
     delete[] batched_dists;
 
@@ -2823,7 +2914,7 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
         std::vector<std::vector<float>> real_embeddings;
         profile_recompute_batches++;
         profile_recompute_nodes += node_ids.size();
-        bool success = fetch_embeddings_http(node_ids, real_embeddings, this->_zmq_port);
+        bool success = fetch_embeddings_http(node_ids, real_embeddings, this->_zmq_port, &profile_deferred_zmq);
         profile_deferred_fetch_us = fetch_timer.elapsed();
         if (!success)
         {
@@ -2913,6 +3004,7 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
         diskann::cout << "compute_timer.elapsed(): " << profile_deferred_distance_us << std::endl;
     }
 
+    profile_stage_timer.reset();
     std::sort(full_retset.begin(), full_retset.end());
     std::unordered_set<uint32_t> profile_final_topk;
     for (uint64_t i = 0; i < std::min<uint64_t>(k_search, full_retset.size()); i++)
@@ -2926,6 +3018,7 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
             event.was_in_final_topk = profile_final_topk.find(event.candidate_id) != profile_final_topk.end();
         }
     }
+    profile_postprocess_sort_us = (float)profile_stage_timer.elapsed();
 
 // Compare PQ results with exact results when skip_search_reorder is true
 #if 0
@@ -2977,6 +3070,7 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
 
     if (use_reorder_data)
     {
+        profile_stage_timer.reset();
         if (!(this->_reorder_data_exists))
         {
             throw ANNException("Requested use of reordering data which does "
@@ -3023,9 +3117,11 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
         }
 
         std::sort(full_retset.begin(), full_retset.end());
+        profile_postprocess_reorder_us = (float)profile_stage_timer.elapsed();
     }
 
     // copy k_search values
+    profile_stage_timer.reset();
     for (uint64_t i = 0; i < k_search; i++)
     {
         indices[i] = full_retset[i].id;
@@ -3049,6 +3145,7 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
             }
         }
     }
+    profile_result_copy_us = (float)profile_stage_timer.elapsed();
 
 #ifdef USE_BING_INFRA
     ctx.m_completeCount = 0;
@@ -3070,9 +3167,24 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
     }
 
     {
+        auto profile_total_us = (float)profile_total_timer.elapsed();
         std::ostringstream profile;
         profile << "{";
-        profile << "\"total_ms\":" << (query_timer.elapsed() / 1000.0f) << ",";
+        profile << "\"total_ms\":" << (profile_total_us / 1000.0f) << ",";
+        profile << "\"setup_ms\":" << (profile_setup_us / 1000.0f) << ",";
+        profile << "\"medoid_ms\":" << (profile_medoid_us / 1000.0f) << ",";
+        profile << "\"traversal_total_ms\":" << (profile_traversal_total_us / 1000.0f) << ",";
+        profile << "\"traversal_frontier_select_ms\":" << (profile_traversal_frontier_select_us / 1000.0f) << ",";
+        profile << "\"traversal_io_ms\":" << (profile_traversal_io_us / 1000.0f) << ",";
+        profile << "\"traversal_cached_expand_ms\":" << (profile_traversal_cached_expand_us / 1000.0f) << ",";
+        profile << "\"traversal_frontier_expand_ms\":" << (profile_traversal_frontier_expand_us / 1000.0f) << ",";
+        profile << "\"traversal_prune_ms\":" << (profile_traversal_prune_us / 1000.0f) << ",";
+        profile << "\"traversal_pq_distance_ms\":" << (profile_traversal_pq_distance_us / 1000.0f) << ",";
+        profile << "\"traversal_heap_update_ms\":" << (profile_traversal_heap_update_us / 1000.0f) << ",";
+        profile << "\"traversal_trace_ms\":" << (profile_traversal_trace_us / 1000.0f) << ",";
+        profile << "\"postprocess_sort_ms\":" << (profile_postprocess_sort_us / 1000.0f) << ",";
+        profile << "\"postprocess_reorder_ms\":" << (profile_postprocess_reorder_us / 1000.0f) << ",";
+        profile << "\"result_copy_ms\":" << (profile_result_copy_us / 1000.0f) << ",";
         profile << "\"nhops\":" << hops << ",";
         profile << "\"num_ios\":" << num_ios << ",";
         profile << "\"num_candidates_seen\":" << profile_candidates_seen << ",";
@@ -3083,6 +3195,12 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
         profile << "\"recompute_requested_nodes_unique\":" << profile_exact_by_node.size() << ",";
         profile << "\"recompute_batches\":" << profile_recompute_batches << ",";
         profile << "\"deferred_fetch_ms\":" << (profile_deferred_fetch_us / 1000.0f) << ",";
+        profile << "\"deferred_zmq_total_ms\":" << (profile_deferred_zmq.total_us / 1000.0f) << ",";
+        profile << "\"deferred_zmq_serialize_ms\":" << (profile_deferred_zmq.serialize_us / 1000.0f) << ",";
+        profile << "\"deferred_zmq_socket_setup_ms\":" << (profile_deferred_zmq.socket_setup_us / 1000.0f) << ",";
+        profile << "\"deferred_zmq_send_ms\":" << (profile_deferred_zmq.send_us / 1000.0f) << ",";
+        profile << "\"deferred_zmq_recv_ms\":" << (profile_deferred_zmq.recv_us / 1000.0f) << ",";
+        profile << "\"deferred_zmq_parse_ms\":" << (profile_deferred_zmq.parse_us / 1000.0f) << ",";
         profile << "\"deferred_distance_ms\":" << (profile_deferred_distance_us / 1000.0f) << ",";
         profile << "\"dedup_distance_nodes_requested\":" << total_nodes_requested << ",";
         profile << "\"dedup_distance_cache_hits\":" << total_nodes_from_cache << ",";

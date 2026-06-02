@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <string>
+#include <mutex>
 
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
@@ -66,5 +67,7 @@ template <typename DT> class StaticDiskIndex
     std::shared_ptr<AlignedFileReader> _reader;
     std::shared_ptr<AlignedFileReader> _graph_reader;
     diskann::PQFlashIndex<DT> _index;
+    mutable std::mutex _profile_mutex;
+    double _last_search_wrapper_ms = 0.0;
 };
 } // namespace diskannpy

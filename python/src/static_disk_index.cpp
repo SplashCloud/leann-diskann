@@ -4,6 +4,7 @@
 #include "static_disk_index.h"
 
 #include "pybind11/numpy.h"
+#include "timer.h"
 
 namespace diskannpy
 {
@@ -66,6 +67,7 @@ NeighborsAndDistances<StaticIdType> StaticDiskIndex<DT>::search(
     const bool recompute_beighbor_embeddings, const bool dedup_node_dis, const float prune_ratio,
     const bool batch_recompute, const bool global_pruning)
 {
+    diskann::Timer wrapper_timer;
     py::array_t<StaticIdType> ids(knn);
     py::array_t<float> dists(knn);
 
@@ -81,6 +83,10 @@ NeighborsAndDistances<StaticIdType> StaticDiskIndex<DT>::search(
     for (uint64_t i = 0; i < knn; ++i)
         r(i) = (unsigned)u64_ids[i];
 
+    {
+        std::lock_guard<std::mutex> lock(_profile_mutex);
+        _last_search_wrapper_ms = (double)wrapper_timer.elapsed() / 1000.0;
+    }
     return std::make_pair(ids, dists);
 }
 
@@ -91,6 +97,7 @@ NeighborsAndDistances<StaticIdType> StaticDiskIndex<DT>::batch_search(
     const bool skip_search_reorder, const bool recompute_beighbor_embeddings, const bool dedup_node_dis,
     const float prune_ratio, const bool batch_recompute, const bool global_pruning)
 {
+    diskann::Timer wrapper_timer;
     py::array_t<StaticIdType> ids({num_queries, knn});
     py::array_t<float> dists({num_queries, knn});
 
@@ -114,6 +121,10 @@ NeighborsAndDistances<StaticIdType> StaticDiskIndex<DT>::batch_search(
         for (uint64_t j = 0; j < knn; ++j)
             r(i, j) = (uint32_t)u64_ids[i * knn + j];
 
+    {
+        std::lock_guard<std::mutex> lock(_profile_mutex);
+        _last_search_wrapper_ms = (double)wrapper_timer.elapsed() / 1000.0;
+    }
     return std::make_pair(ids, dists);
 }
 
@@ -132,7 +143,20 @@ void StaticDiskIndex<DT>::set_zmq_port(int port)
 template <typename DT>
 std::string StaticDiskIndex<DT>::get_last_search_profile_json() const
 {
-    return _index.get_last_search_profile_json();
+    std::string profile = _index.get_last_search_profile_json();
+    double wrapper_ms = 0.0;
+    {
+        std::lock_guard<std::mutex> lock(_profile_mutex);
+        wrapper_ms = _last_search_wrapper_ms;
+    }
+    if (!profile.empty() && profile.back() == '}')
+    {
+        profile.pop_back();
+        profile += ",\"wrapper_search_ms\":";
+        profile += std::to_string(wrapper_ms);
+        profile += "}";
+    }
+    return profile;
 }
 
 template class StaticDiskIndex<float>;
