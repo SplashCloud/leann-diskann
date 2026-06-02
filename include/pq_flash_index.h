@@ -4,6 +4,8 @@
 #pragma once
 #include "common_includes.h"
 
+#include <mutex>
+
 #include "aligned_file_reader.h"
 #include "concurrent_queue.h"
 #include "neighbor.h"
@@ -115,6 +117,8 @@ template <typename T, typename LabelT = uint32_t> class PQFlashIndex
     std::shared_ptr<AlignedFileReader> &reader;
 
     DISKANN_DLLEXPORT diskann::Metric get_metric();
+
+    DISKANN_DLLEXPORT std::string get_last_search_profile_json() const;
 
     //
     // node_ids: input list of node_ids to be read
@@ -248,6 +252,8 @@ template <typename T, typename LabelT = uint32_t> class PQFlashIndex
     bool _count_visited_nodes = false;
     bool _reorder_data_exists = false;
     uint64_t _reoreder_data_offset = 0;
+    mutable std::mutex _profile_mutex;
+    std::string _last_search_profile_json = "{}";
 
     // filter support
     uint32_t *_pts_to_label_offsets = nullptr;

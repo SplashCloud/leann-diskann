@@ -129,6 +129,12 @@ void StaticDiskIndex<DT>::set_zmq_port(int port)
     _index._zmq_port = port;
 }
 
+template <typename DT>
+std::string StaticDiskIndex<DT>::get_last_search_profile_json() const
+{
+    return _index.get_last_search_profile_json();
+}
+
 template class StaticDiskIndex<float>;
 template class StaticDiskIndex<uint8_t>;
 template class StaticDiskIndex<int8_t>;

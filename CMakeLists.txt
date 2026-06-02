@@ -17,7 +17,9 @@
 
 # Some variables like MSVC are defined only after project(), so put that first.
 cmake_minimum_required(VERSION 3.20)
-cmake_policy(SET CMP0167 NEW)
+if(POLICY CMP0167)
+    cmake_policy(SET CMP0167 NEW)
+endif()
 project(diskann)
 
 #Set option to use tcmalloc

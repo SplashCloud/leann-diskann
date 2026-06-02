@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <memory>
 #include <cmath>
+#include <cstdlib>
+#include <unordered_set>
 
 #include "timer.h"
 #include "pq.h"
@@ -41,6 +43,66 @@ namespace diskann
 {
 static std::mutex log_file_mutex;
 static std::atomic<int> search_counter(0);
+
+namespace
+{
+struct DiskannCandidateTraceEvent
+{
+    uint32_t hop_id = 0;
+    uint32_t candidate_id = 0;
+    int64_t parent_id = -1;
+    uint64_t candidate_degree = 0;
+    bool is_high_degree = false;
+    float pq_distance = 0.0f;
+    int64_t pq_rank = -1;
+    float exact_distance = std::numeric_limits<float>::quiet_NaN();
+    bool was_selected_for_recompute = false;
+    bool was_recomputed = false;
+    bool was_in_final_topk = false;
+};
+
+struct DiskannHopTraceEvent
+{
+    uint32_t hop_id = 0;
+    std::vector<uint32_t> frontier;
+    std::vector<uint32_t> cached_frontier;
+};
+
+static bool diskann_trace_enabled()
+{
+    const char *env = std::getenv("LEANN_DISKANN_TRACE");
+    return env != nullptr && std::string(env) != "0" && std::string(env) != "false" && std::string(env) != "False";
+}
+
+static size_t diskann_trace_limit()
+{
+    const char *env = std::getenv("LEANN_DISKANN_TRACE_LIMIT");
+    if (env == nullptr)
+    {
+        return 10000;
+    }
+    try
+    {
+        return static_cast<size_t>(std::stoull(env));
+    }
+    catch (...)
+    {
+        return 10000;
+    }
+}
+
+static void append_json_float(std::ostringstream &oss, float value)
+{
+    if (std::isfinite(value))
+    {
+        oss << value;
+    }
+    else
+    {
+        oss << "null";
+    }
+}
+} // namespace
 
 template <typename T, typename LabelT>
 PQFlashIndex<T, LabelT>::PQFlashIndex(std::shared_ptr<AlignedFileReader> &fileReader,
@@ -112,6 +174,12 @@ template <typename T, typename LabelT> PQFlashIndex<T, LabelT>::~PQFlashIndex()
     {
         delete[] _medoids;
     }
+}
+
+template <typename T, typename LabelT> std::string PQFlashIndex<T, LabelT>::get_last_search_profile_json() const
+{
+    std::lock_guard<std::mutex> lock(_profile_mutex);
+    return _last_search_profile_json;
 }
 
 template <typename T, typename LabelT> inline uint64_t PQFlashIndex<T, LabelT>::get_node_sector(uint64_t node_id)
@@ -2103,6 +2171,24 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
         delete[] dists_out;
     };
     Timer query_timer, io_timer, cpu_timer;
+    const bool trace_enabled = diskann_trace_enabled();
+    const size_t trace_limit = diskann_trace_limit();
+    std::vector<DiskannCandidateTraceEvent> candidate_trace;
+    std::vector<DiskannHopTraceEvent> hop_trace;
+    if (trace_enabled)
+    {
+        candidate_trace.reserve(std::min<size_t>(trace_limit, 4096));
+        hop_trace.reserve(256);
+    }
+    uint64_t profile_candidate_events_total = 0;
+    uint64_t profile_candidate_events_recorded = 0;
+    uint64_t profile_candidates_seen = 0;
+    uint64_t profile_recompute_nodes = 0;
+    uint64_t profile_recompute_batches = 0;
+    float profile_deferred_fetch_us = 0.0f;
+    float profile_deferred_distance_us = 0.0f;
+    std::unordered_map<uint32_t, size_t> profile_event_by_node;
+    std::unordered_map<uint32_t, float> profile_exact_by_node;
 
     NeighborPriorityQueue &retset = query_scratch->retset;
     retset.reserve(l_search);
@@ -2176,6 +2262,46 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
     {
         batched_dists = new float[_max_degree * beam_width + 5];
     }
+    auto record_candidate_trace = [&](uint32_t hop_id, int64_t parent_id, uint32_t *node_nbrs, uint64_t nnbrs,
+                                      float *dists, bool selected_for_recompute) {
+        profile_candidates_seen += nnbrs;
+        profile_candidate_events_total += nnbrs;
+        if (!trace_enabled || nnbrs == 0)
+        {
+            return;
+        }
+        std::vector<uint64_t> order(nnbrs);
+        for (uint64_t i = 0; i < nnbrs; i++)
+        {
+            order[i] = i;
+        }
+        std::sort(order.begin(), order.end(), [&](uint64_t a, uint64_t b) { return dists[a] < dists[b]; });
+        std::vector<int64_t> ranks(nnbrs, -1);
+        for (uint64_t rank = 0; rank < nnbrs; rank++)
+        {
+            ranks[order[rank]] = static_cast<int64_t>(rank);
+        }
+        for (uint64_t i = 0; i < nnbrs; i++)
+        {
+            if (candidate_trace.size() >= trace_limit)
+            {
+                continue;
+            }
+            DiskannCandidateTraceEvent event;
+            event.hop_id = hop_id;
+            event.candidate_id = node_nbrs[i];
+            event.parent_id = parent_id;
+            event.candidate_degree = nnbrs;
+            event.is_high_degree = nnbrs > _max_degree / 2;
+            event.pq_distance = dists[i];
+            event.pq_rank = ranks[i];
+            event.was_selected_for_recompute = selected_for_recompute;
+            event.was_recomputed = recompute_beighbor_embeddings;
+            profile_event_by_node[event.candidate_id] = candidate_trace.size();
+            candidate_trace.push_back(event);
+            profile_candidate_events_recorded++;
+        }
+    };
 
     while (retset.has_unexpanded_node() && num_ios < io_limit)
     {
@@ -2208,6 +2334,18 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
             {
                 reinterpret_cast<std::atomic<uint32_t> &>(this->_node_visit_counter[nbr.id].second).fetch_add(1);
             }
+        }
+        if (trace_enabled && hop_trace.size() < trace_limit)
+        {
+            DiskannHopTraceEvent hop_event;
+            hop_event.hop_id = hops;
+            hop_event.frontier = frontier;
+            hop_event.cached_frontier.reserve(cached_nhoods.size());
+            for (auto &cached_nhood : cached_nhoods)
+            {
+                hop_event.cached_frontier.push_back(cached_nhood.first);
+            }
+            hop_trace.push_back(std::move(hop_event));
         }
 
         std::vector<AlignedRead> graph_read_reqs;
@@ -2376,6 +2514,8 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
             // compute node_nbrs <-> query dists in PQ space
             cpu_timer.reset();
             compute_dists(node_nbrs, nnbrs, dist_scratch);
+            record_candidate_trace(hops, static_cast<int64_t>(node_id), node_nbrs, nnbrs, dist_scratch,
+                                   recompute_beighbor_embeddings);
             if (stats != nullptr)
             {
                 stats->n_cmps += (uint32_t)nnbrs;
@@ -2573,6 +2713,8 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
             {
                 prune_node_nbrs(node_nbrs, nnbrs);
                 compute_dists(node_nbrs, nnbrs, dist_scratch);
+                record_candidate_trace(hops, static_cast<int64_t>(node_id), node_nbrs, nnbrs, dist_scratch,
+                                       recompute_beighbor_embeddings);
                 if (stats != nullptr)
                 {
                     stats->n_cmps += (uint32_t)nnbrs;
@@ -2623,6 +2765,7 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
             prune_node_nbrs(batched_data_ptr, nnbrs);             // Prune using the pointer, nnbrs is updated
 
             compute_dists(batched_data_ptr, nnbrs, batched_dists); // Compute dists for the pruned set
+            record_candidate_trace(hops, -1, batched_data_ptr, nnbrs, batched_dists, recompute_beighbor_embeddings);
             // ! Not sure if dist_scratch has enough space
 
             // process prefetch-ed nhood
@@ -2678,7 +2821,10 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
 
         Timer fetch_timer;
         std::vector<std::vector<float>> real_embeddings;
+        profile_recompute_batches++;
+        profile_recompute_nodes += node_ids.size();
         bool success = fetch_embeddings_http(node_ids, real_embeddings, this->_zmq_port);
+        profile_deferred_fetch_us = fetch_timer.elapsed();
         if (!success)
         {
             throw ANNException("Failed to fetch embeddings", -1, __FUNCSIG__, __FILE__, __LINE__);
@@ -2744,6 +2890,14 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
             dist = _dist_cmp->compare(aligned_query_T, data_buf, (uint32_t)_aligned_dim);
 
             full_retset[i].distance = dist;
+            profile_exact_by_node[full_retset[i].id] = dist;
+            auto event_iter = profile_event_by_node.find(full_retset[i].id);
+            if (event_iter != profile_event_by_node.end() && event_iter->second < candidate_trace.size())
+            {
+                candidate_trace[event_iter->second].exact_distance = dist;
+                candidate_trace[event_iter->second].was_selected_for_recompute = true;
+                candidate_trace[event_iter->second].was_recomputed = true;
+            }
 
 #if 0
             if (abs(dist - exact_dist_retset[i].distance) > 5e-4)
@@ -2752,13 +2906,26 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                 diskann::cout << "dist: " << dist << std::endl;
                 diskann::cout << "exact_dist_retset[i].distance: " << exact_dist_retset[i].distance << std::endl;
                 assert(false);
-            }
+    }
 #endif
         }
-        diskann::cout << "compute_timer.elapsed(): " << compute_timer.elapsed() << std::endl;
+        profile_deferred_distance_us = compute_timer.elapsed();
+        diskann::cout << "compute_timer.elapsed(): " << profile_deferred_distance_us << std::endl;
     }
 
     std::sort(full_retset.begin(), full_retset.end());
+    std::unordered_set<uint32_t> profile_final_topk;
+    for (uint64_t i = 0; i < std::min<uint64_t>(k_search, full_retset.size()); i++)
+    {
+        profile_final_topk.insert(full_retset[i].id);
+    }
+    if (trace_enabled)
+    {
+        for (auto &event : candidate_trace)
+        {
+            event.was_in_final_topk = profile_final_topk.find(event.candidate_id) != profile_final_topk.end();
+        }
+    }
 
 // Compare PQ results with exact results when skip_search_reorder is true
 #if 0
@@ -2900,6 +3067,90 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
         diskann::cout << "  Total nodes requested: " << total_nodes_requested << std::endl;
         diskann::cout << "  Nodes served from cache: " << total_nodes_from_cache << std::endl;
         diskann::cout << "  Cache hit rate: " << cache_hit_rate << "%" << std::endl;
+    }
+
+    {
+        std::ostringstream profile;
+        profile << "{";
+        profile << "\"total_ms\":" << (query_timer.elapsed() / 1000.0f) << ",";
+        profile << "\"nhops\":" << hops << ",";
+        profile << "\"num_ios\":" << num_ios << ",";
+        profile << "\"num_candidates_seen\":" << profile_candidates_seen << ",";
+        profile << "\"candidate_trace_events_total\":" << profile_candidate_events_total << ",";
+        profile << "\"candidate_trace_events_recorded\":" << profile_candidate_events_recorded << ",";
+        profile << "\"candidate_trace_truncated\":" << (profile_candidate_events_total > profile_candidate_events_recorded ? "true" : "false") << ",";
+        profile << "\"recompute_requested_nodes_total\":" << profile_recompute_nodes << ",";
+        profile << "\"recompute_requested_nodes_unique\":" << profile_exact_by_node.size() << ",";
+        profile << "\"recompute_batches\":" << profile_recompute_batches << ",";
+        profile << "\"deferred_fetch_ms\":" << (profile_deferred_fetch_us / 1000.0f) << ",";
+        profile << "\"deferred_distance_ms\":" << (profile_deferred_distance_us / 1000.0f) << ",";
+        profile << "\"dedup_distance_nodes_requested\":" << total_nodes_requested << ",";
+        profile << "\"dedup_distance_cache_hits\":" << total_nodes_from_cache << ",";
+        profile << "\"hop_trace\":[";
+        for (size_t i = 0; i < hop_trace.size(); i++)
+        {
+            if (i > 0)
+                profile << ",";
+            profile << "{\"hop_id\":" << hop_trace[i].hop_id << ",\"frontier\":[";
+            for (size_t j = 0; j < hop_trace[i].frontier.size(); j++)
+            {
+                if (j > 0)
+                    profile << ",";
+                profile << hop_trace[i].frontier[j];
+            }
+            profile << "],\"cached_frontier\":[";
+            for (size_t j = 0; j < hop_trace[i].cached_frontier.size(); j++)
+            {
+                if (j > 0)
+                    profile << ",";
+                profile << hop_trace[i].cached_frontier[j];
+            }
+            profile << "]}";
+        }
+        profile << "],\"recomputed_nodes\":[";
+        size_t recomputed_idx = 0;
+        for (const auto &item : profile_exact_by_node)
+        {
+            if (recomputed_idx++ > 0)
+                profile << ",";
+            profile << "{\"node_id\":" << item.first << ",\"exact_distance\":";
+            append_json_float(profile, item.second);
+            profile << ",\"was_in_final_topk\":"
+                    << (profile_final_topk.find(item.first) != profile_final_topk.end() ? "true" : "false") << "}";
+        }
+        profile << "]";
+        if (trace_enabled)
+        {
+            profile << ",\"candidate_trace\":[";
+            for (size_t i = 0; i < candidate_trace.size(); i++)
+            {
+                const auto &event = candidate_trace[i];
+                if (i > 0)
+                    profile << ",";
+                profile << "{\"hop_id\":" << event.hop_id << ",";
+                profile << "\"candidate_id\":" << event.candidate_id << ",";
+                profile << "\"parent_id\":" << event.parent_id << ",";
+                profile << "\"candidate_degree\":" << event.candidate_degree << ",";
+                profile << "\"is_high_degree\":" << (event.is_high_degree ? "true" : "false") << ",";
+                profile << "\"pq_distance\":";
+                append_json_float(profile, event.pq_distance);
+                profile << ",\"pq_rank\":" << event.pq_rank << ",";
+                profile << "\"exact_distance_if_recomputed\":";
+                append_json_float(profile, event.exact_distance);
+                profile << ",\"was_selected_for_recompute\":"
+                        << (event.was_selected_for_recompute ? "true" : "false") << ",";
+                profile << "\"was_recomputed\":" << (event.was_recomputed ? "true" : "false") << ",";
+                profile << "\"was_in_final_topk\":" << (event.was_in_final_topk ? "true" : "false") << "}";
+            }
+            profile << "]";
+        }
+        else
+        {
+            profile << ",\"candidate_trace\":[]";
+        }
+        profile << "}";
+        std::lock_guard<std::mutex> lock(_profile_mutex);
+        _last_search_profile_json = profile.str();
     }
 }
 

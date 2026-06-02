@@ -99,7 +99,8 @@ template <typename T> inline void add_variant(py::module_ &m, const Variant &var
              "skip_search_reorder"_a = false, "recompute_beighbor_embeddings"_a = false, "dedup_node_dis"_a = false,
              "prune_ratio"_a = 0, "batch_recompute"_a = false, "global_pruning"_a = false)
         .def("get_zmq_port", &diskannpy::StaticDiskIndex<T>::get_zmq_port)
-        .def("set_zmq_port", &diskannpy::StaticDiskIndex<T>::set_zmq_port, "port"_a);
+        .def("set_zmq_port", &diskannpy::StaticDiskIndex<T>::set_zmq_port, "port"_a)
+        .def("get_last_search_profile_json", &diskannpy::StaticDiskIndex<T>::get_last_search_profile_json);
 }
 
 PYBIND11_MODULE(_diskannpy, m)

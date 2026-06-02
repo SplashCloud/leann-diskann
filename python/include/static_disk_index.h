@@ -60,6 +60,7 @@ template <typename DT> class StaticDiskIndex
     // ZMQ port access methods
     int get_zmq_port() const;
     void set_zmq_port(int port);
+    std::string get_last_search_profile_json() const;
 
   private:
     std::shared_ptr<AlignedFileReader> _reader;
