@@ -2035,11 +2035,45 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
     uint8_t *pq_coord_scratch = pq_query_scratch->aligned_pq_coord_scratch;
 
     std::map<int, float> node_distances;
+    const bool trace_enabled = diskann_trace_enabled();
+    const size_t trace_limit = diskann_trace_limit();
+    std::vector<DiskannHopTraceEvent> hop_trace;
+    DiskannHopTraceEvent *active_hop_trace = nullptr;
+    if (trace_enabled)
+    {
+        hop_trace.reserve(256);
+    }
+
+    Timer query_timer, io_timer, cpu_timer;
+    uint64_t profile_recompute_nodes = 0;
+    uint64_t profile_recompute_batches = 0;
+    float profile_deferred_fetch_us = 0.0f;
+    float profile_deferred_distance_us = 0.0f;
+    float profile_setup_us = (float)profile_stage_timer.elapsed();
+    float profile_medoid_us = 0.0f;
+    float profile_traversal_total_us = 0.0f;
+    float profile_traversal_frontier_select_us = 0.0f;
+    float profile_traversal_io_us = 0.0f;
+    float profile_traversal_cached_expand_us = 0.0f;
+    float profile_traversal_frontier_expand_us = 0.0f;
+    float profile_traversal_prune_us = 0.0f;
+    float profile_traversal_pq_distance_us = 0.0f;
+    float profile_traversal_heap_update_us = 0.0f;
+    float profile_traversal_trace_us = 0.0f;
+    float profile_postprocess_sort_us = 0.0f;
+    float profile_postprocess_reorder_us = 0.0f;
+    float profile_result_copy_us = 0.0f;
+    DiskannZmqFetchProfile profile_deferred_zmq;
+    std::unordered_map<uint32_t, float> profile_exact_by_node;
+    std::unordered_set<uint32_t> profile_recompute_unique_nodes;
 
     // Lambda to batch compute query<->node distances in PQ space
     auto compute_dists = [this, pq_coord_scratch, pq_dists, aligned_query_T, recompute_beighbor_embeddings, data_buf,
-                          &node_distances, &total_nodes_requested, &total_nodes_from_cache,
-                          dedup_node_dis](const uint32_t *ids, const uint64_t n_ids, float *dists_out) {
+                          &node_distances, &total_nodes_requested, &total_nodes_from_cache, dedup_node_dis,
+                          trace_enabled, trace_limit, &active_hop_trace, &profile_recompute_nodes,
+                          &profile_recompute_batches,
+                          &profile_recompute_unique_nodes](const uint32_t *ids, const uint64_t n_ids,
+                                                            float *dists_out) {
         // Vector[0], {3, 6, 2}
         // Distance = d[3][1] + d[6][2] + d[2][3]
         // recompute_beighbor_embeddings = true;
@@ -2102,6 +2136,19 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                 diskann::pq_dist_lookup(pq_coord_scratch, n_ids, this->_n_chunks, pq_dists, dists_out);
                 return;
             }
+            profile_recompute_batches++;
+            profile_recompute_nodes += node_ids.size();
+            profile_recompute_unique_nodes.insert(node_ids.begin(), node_ids.end());
+            if (trace_enabled && active_hop_trace != nullptr)
+            {
+                const size_t remaining =
+                    trace_limit > active_hop_trace->recomputed_nodes.size()
+                        ? trace_limit - active_hop_trace->recomputed_nodes.size()
+                        : 0;
+                const size_t n_record = std::min<size_t>(node_ids.size(), remaining);
+                active_hop_trace->recomputed_nodes.insert(
+                    active_hop_trace->recomputed_nodes.end(), node_ids.begin(), node_ids.begin() + n_record);
+            }
 
             // Preprocess the fetched embeddings to match the format used in diskann
             preprocess_fetched_embeddings(embeddings, this->metric, this->_max_base_norm, this->_data_dim);
@@ -2157,15 +2204,6 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                         std::greater<std::pair<float, uint32_t>>>
         aq_priority_queue;
     tsl::robin_set<size_t> &visited = query_scratch->visited;
-    const bool trace_enabled = diskann_trace_enabled();
-    const size_t trace_limit = diskann_trace_limit();
-    std::vector<DiskannHopTraceEvent> hop_trace;
-    DiskannHopTraceEvent *active_hop_trace = nullptr;
-    if (trace_enabled)
-    {
-        hop_trace.reserve(256);
-    }
-
     // TODO: implement this function
     // 1. Based on some heristic to prune the node_nbrs and nnbrs that is not promising
     // 1.1 heruistic 1: use higher compression PQ to prune the node_nbrs and nnbrs that is not promising in path
@@ -2292,28 +2330,6 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
         // Free the allocated memory
         delete[] dists_out;
     };
-    Timer query_timer, io_timer, cpu_timer;
-    uint64_t profile_recompute_nodes = 0;
-    uint64_t profile_recompute_batches = 0;
-    float profile_deferred_fetch_us = 0.0f;
-    float profile_deferred_distance_us = 0.0f;
-    float profile_setup_us = (float)profile_stage_timer.elapsed();
-    float profile_medoid_us = 0.0f;
-    float profile_traversal_total_us = 0.0f;
-    float profile_traversal_frontier_select_us = 0.0f;
-    float profile_traversal_io_us = 0.0f;
-    float profile_traversal_cached_expand_us = 0.0f;
-    float profile_traversal_frontier_expand_us = 0.0f;
-    float profile_traversal_prune_us = 0.0f;
-    float profile_traversal_pq_distance_us = 0.0f;
-    float profile_traversal_heap_update_us = 0.0f;
-    float profile_traversal_trace_us = 0.0f;
-    float profile_postprocess_sort_us = 0.0f;
-    float profile_postprocess_reorder_us = 0.0f;
-    float profile_result_copy_us = 0.0f;
-    DiskannZmqFetchProfile profile_deferred_zmq;
-    std::unordered_map<uint32_t, float> profile_exact_by_node;
-
     NeighborPriorityQueue &retset = query_scratch->retset;
     retset.reserve(l_search);
     std::vector<Neighbor> &full_retset = query_scratch->full_retset;
@@ -2388,19 +2404,6 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
     {
         batched_dists = new float[_max_degree * beam_width + 5];
     }
-    auto record_recomputed_nodes = [&](uint32_t *node_nbrs, uint64_t nnbrs, bool selected_for_recompute) {
-        if (trace_enabled && selected_for_recompute && active_hop_trace != nullptr)
-        {
-            const size_t remaining =
-                trace_limit > active_hop_trace->recomputed_nodes.size()
-                    ? trace_limit - active_hop_trace->recomputed_nodes.size()
-                    : 0;
-            const size_t n_record = std::min<size_t>(nnbrs, remaining);
-            active_hop_trace->recomputed_nodes.insert(
-                active_hop_trace->recomputed_nodes.end(), node_nbrs, node_nbrs + n_record);
-        }
-    };
-
     Timer traversal_timer;
     while (retset.has_unexpanded_node() && num_ios < io_limit)
     {
@@ -2644,7 +2647,6 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                 }
             }
             profile_traversal_pq_distance_us += pq_elapsed;
-            record_recomputed_nodes(node_nbrs, nnbrs, recompute_beighbor_embeddings);
             if (stats != nullptr)
             {
                 stats->n_cmps += (uint32_t)nnbrs;
@@ -2867,7 +2869,6 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                     }
                 }
                 profile_traversal_pq_distance_us += pq_elapsed;
-                record_recomputed_nodes(node_nbrs, nnbrs, recompute_beighbor_embeddings);
                 if (stats != nullptr)
                 {
                     stats->n_cmps += (uint32_t)nnbrs;
@@ -2942,7 +2943,6 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                 }
             }
             profile_traversal_pq_distance_us += pq_elapsed;
-            record_recomputed_nodes(batched_data_ptr, nnbrs, recompute_beighbor_embeddings);
             // ! Not sure if dist_scratch has enough space
 
             // process prefetch-ed nhood
@@ -3010,6 +3010,7 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
         std::vector<std::vector<float>> real_embeddings;
         profile_recompute_batches++;
         profile_recompute_nodes += node_ids.size();
+        profile_recompute_unique_nodes.insert(node_ids.begin(), node_ids.end());
         bool success = fetch_embeddings_http(node_ids, real_embeddings, this->_zmq_port, &profile_deferred_zmq);
         profile_deferred_fetch_us = fetch_timer.elapsed();
         if (!success)
@@ -3099,6 +3100,7 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
             last_hop.recomputed_nodes.insert(
                 last_hop.recomputed_nodes.end(), node_ids.begin(), node_ids.begin() + n_record);
             last_hop.recompute_embedding_us += profile_deferred_fetch_us + profile_deferred_distance_us;
+            last_hop.latency_us += profile_deferred_fetch_us + profile_deferred_distance_us;
         }
         diskann::cout << "compute_timer.elapsed(): " << profile_deferred_distance_us << std::endl;
     }
@@ -3256,11 +3258,7 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
     {
         auto profile_total_us = (float)profile_total_timer.elapsed();
         uint64_t trace_recompute_nodes_total = profile_recompute_nodes;
-        std::unordered_set<uint32_t> trace_recompute_nodes_unique;
-        for (const auto &item : profile_exact_by_node)
-        {
-            trace_recompute_nodes_unique.insert(item.first);
-        }
+        std::unordered_set<uint32_t> trace_recompute_nodes_unique = profile_recompute_unique_nodes;
         if (trace_recompute_nodes_total == 0 || trace_recompute_nodes_unique.empty())
         {
             trace_recompute_nodes_total = 0;
