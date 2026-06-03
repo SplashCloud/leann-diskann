@@ -66,6 +66,12 @@ struct DiskannHopTraceEvent
     uint32_t hop_id = 0;
     std::vector<uint32_t> frontier;
     std::vector<uint32_t> cached_frontier;
+    std::vector<uint32_t> explored_vertices;
+    std::vector<Neighbor> eq_before;
+    std::vector<Neighbor> eq_after;
+    std::vector<Neighbor> aq_before;
+    std::vector<Neighbor> aq_after;
+    std::vector<uint32_t> recomputed_nodes;
 };
 
 struct DiskannZmqFetchProfile
@@ -111,6 +117,60 @@ static void append_json_float(std::ostringstream &oss, float value)
     {
         oss << "null";
     }
+}
+
+static std::vector<Neighbor> snapshot_eq(const NeighborPriorityQueue &queue, size_t limit)
+{
+    std::vector<Neighbor> out;
+    const size_t n = std::min(queue.size(), limit);
+    out.reserve(n);
+    for (size_t i = 0; i < n; i++)
+    {
+        out.push_back(queue[i]);
+    }
+    return out;
+}
+
+static std::vector<Neighbor> snapshot_aq(
+    std::priority_queue<std::pair<float, uint32_t>, std::vector<std::pair<float, uint32_t>>,
+                        std::greater<std::pair<float, uint32_t>>>
+        queue,
+    size_t limit)
+{
+    std::vector<Neighbor> out;
+    while (!queue.empty() && out.size() < limit)
+    {
+        const auto item = queue.top();
+        queue.pop();
+        out.emplace_back(item.second, item.first);
+    }
+    return out;
+}
+
+static void append_json_uint32_array(std::ostringstream &oss, const std::vector<uint32_t> &values)
+{
+    oss << "[";
+    for (size_t i = 0; i < values.size(); i++)
+    {
+        if (i > 0)
+            oss << ",";
+        oss << values[i];
+    }
+    oss << "]";
+}
+
+static void append_json_neighbors(std::ostringstream &oss, const std::vector<Neighbor> &values)
+{
+    oss << "[";
+    for (size_t i = 0; i < values.size(); i++)
+    {
+        if (i > 0)
+            oss << ",";
+        oss << "{\"node_id\":" << values[i].id << ",\"distance\":";
+        append_json_float(oss, values[i].distance);
+        oss << ",\"expanded\":" << (values[i].expanded ? "true" : "false") << "}";
+    }
+    oss << "]";
 }
 } // namespace
 
@@ -2113,6 +2173,16 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                         std::greater<std::pair<float, uint32_t>>>
         aq_priority_queue;
     tsl::robin_set<size_t> &visited = query_scratch->visited;
+    const bool trace_enabled = diskann_trace_enabled();
+    const size_t trace_limit = diskann_trace_limit();
+    std::vector<DiskannCandidateTraceEvent> candidate_trace;
+    std::vector<DiskannHopTraceEvent> hop_trace;
+    DiskannHopTraceEvent *active_hop_trace = nullptr;
+    if (trace_enabled)
+    {
+        candidate_trace.reserve(std::min<size_t>(trace_limit, 4096));
+        hop_trace.reserve(256);
+    }
 
     // TODO: implement this function
     // 1. Based on some heristic to prune the node_nbrs and nnbrs that is not promising
@@ -2120,8 +2190,8 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
     // /powerrag/scaling_out/embeddings/facebook/contriever-msmarco/rpj_wiki/compressed_2/
     // 1.2 heruistic 2: use a lightweight reranker to rerank the node_nbrs and nnbrs that is not promising
     auto prune_node_nbrs = [this, pq_coord_scratch, pq_dists, recompute_beighbor_embeddings, dedup_node_dis,
-                            prune_ratio, global_pruning, &aq_priority_queue,
-                            &visited](uint32_t *&node_nbrs, uint64_t &nnbrs) {
+                            prune_ratio, global_pruning, &aq_priority_queue, &visited, trace_enabled, trace_limit,
+                            &active_hop_trace](uint32_t *&node_nbrs, uint64_t &nnbrs) {
         if (!recompute_beighbor_embeddings)
         {
             return;
@@ -2139,12 +2209,21 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
         diskann::aggregate_coords(node_nbrs, nnbrs, this->data, this->_n_chunks, pq_coord_scratch);
         diskann::pq_dist_lookup(pq_coord_scratch, nnbrs, this->_n_chunks, pq_dists, dists_out);
 
+        if (trace_enabled && active_hop_trace != nullptr)
+        {
+            active_hop_trace->aq_before = snapshot_aq(aq_priority_queue, trace_limit);
+        }
+
         if (global_pruning)
         {
             // Add the distance and node_id to the priority queue
             for (uint64_t i = 0; i < nnbrs; i++)
             {
                 aq_priority_queue.push(std::make_pair(dists_out[i], node_nbrs[i]));
+            }
+            if (trace_enabled && active_hop_trace != nullptr)
+            {
+                active_hop_trace->aq_after = snapshot_aq(aq_priority_queue, trace_limit);
             }
             // select all ratio=prune_ratio in aq_priority_queue but need to check if the node_id is already visited,
             // dont need to pop
@@ -2212,19 +2291,21 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
             nnbrs = new_nnbrs;
         }
 
+        if (trace_enabled && active_hop_trace != nullptr)
+        {
+            active_hop_trace->aq_after.clear();
+            const size_t limit = std::min<size_t>(scored_nbrs.size(), trace_limit);
+            active_hop_trace->aq_after.reserve(limit);
+            for (size_t i = 0; i < limit; i++)
+            {
+                active_hop_trace->aq_after.emplace_back(scored_nbrs[i].first, scored_nbrs[i].second);
+            }
+        }
+
         // Free the allocated memory
         delete[] dists_out;
     };
     Timer query_timer, io_timer, cpu_timer;
-    const bool trace_enabled = diskann_trace_enabled();
-    const size_t trace_limit = diskann_trace_limit();
-    std::vector<DiskannCandidateTraceEvent> candidate_trace;
-    std::vector<DiskannHopTraceEvent> hop_trace;
-    if (trace_enabled)
-    {
-        candidate_trace.reserve(std::min<size_t>(trace_limit, 4096));
-        hop_trace.reserve(256);
-    }
     uint64_t profile_candidate_events_total = 0;
     uint64_t profile_candidate_events_recorded = 0;
     uint64_t profile_candidates_seen = 0;
@@ -2329,6 +2410,16 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
         Timer trace_timer;
         profile_candidates_seen += nnbrs;
         profile_candidate_events_total += nnbrs;
+        if (trace_enabled && selected_for_recompute && active_hop_trace != nullptr)
+        {
+            const size_t remaining =
+                trace_limit > active_hop_trace->recomputed_nodes.size()
+                    ? trace_limit - active_hop_trace->recomputed_nodes.size()
+                    : 0;
+            const size_t n_record = std::min<size_t>(nnbrs, remaining);
+            active_hop_trace->recomputed_nodes.insert(
+                active_hop_trace->recomputed_nodes.end(), node_nbrs, node_nbrs + n_record);
+        }
         if (!trace_enabled || nnbrs == 0)
         {
             profile_traversal_trace_us += (float)trace_timer.elapsed();
@@ -2371,6 +2462,16 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
     Timer traversal_timer;
     while (retset.has_unexpanded_node() && num_ios < io_limit)
     {
+        active_hop_trace = nullptr;
+        if (trace_enabled && hop_trace.size() < trace_limit)
+        {
+            DiskannHopTraceEvent hop_event;
+            hop_event.hop_id = hops;
+            hop_event.eq_before = snapshot_eq(retset, trace_limit);
+            hop_trace.push_back(std::move(hop_event));
+            active_hop_trace = &hop_trace.back();
+        }
+
         // clear iteration state
         frontier.clear();
         frontier_nhoods.clear();
@@ -2403,17 +2504,18 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
             }
         }
         profile_traversal_frontier_select_us += (float)profile_stage_timer.elapsed();
-        if (trace_enabled && hop_trace.size() < trace_limit)
+        if (trace_enabled && active_hop_trace != nullptr)
         {
-            DiskannHopTraceEvent hop_event;
-            hop_event.hop_id = hops;
+            DiskannHopTraceEvent &hop_event = *active_hop_trace;
             hop_event.frontier = frontier;
             hop_event.cached_frontier.reserve(cached_nhoods.size());
             for (auto &cached_nhood : cached_nhoods)
             {
                 hop_event.cached_frontier.push_back(cached_nhood.first);
             }
-            hop_trace.push_back(std::move(hop_event));
+            hop_event.explored_vertices = hop_event.frontier;
+            hop_event.explored_vertices.insert(
+                hop_event.explored_vertices.end(), hop_event.cached_frontier.begin(), hop_event.cached_frontier.end());
         }
 
         std::vector<AlignedRead> graph_read_reqs;
@@ -2884,6 +2986,11 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
         profile_traversal_frontier_expand_us += (float)profile_stage_timer.elapsed();
         // }
         // }
+        if (trace_enabled && active_hop_trace != nullptr)
+        {
+            active_hop_trace->eq_after = snapshot_eq(retset, trace_limit);
+        }
+        active_hop_trace = nullptr;
         hops++;
     }
     profile_traversal_total_us = (float)traversal_timer.elapsed();
@@ -3209,21 +3316,24 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
         {
             if (i > 0)
                 profile << ",";
-            profile << "{\"hop_id\":" << hop_trace[i].hop_id << ",\"frontier\":[";
-            for (size_t j = 0; j < hop_trace[i].frontier.size(); j++)
-            {
-                if (j > 0)
-                    profile << ",";
-                profile << hop_trace[i].frontier[j];
-            }
-            profile << "],\"cached_frontier\":[";
-            for (size_t j = 0; j < hop_trace[i].cached_frontier.size(); j++)
-            {
-                if (j > 0)
-                    profile << ",";
-                profile << hop_trace[i].cached_frontier[j];
-            }
-            profile << "]}";
+            profile << "{\"hop_id\":" << hop_trace[i].hop_id << ",";
+            profile << "\"frontier\":";
+            append_json_uint32_array(profile, hop_trace[i].frontier);
+            profile << ",\"cached_frontier\":";
+            append_json_uint32_array(profile, hop_trace[i].cached_frontier);
+            profile << ",\"explored_vertices\":";
+            append_json_uint32_array(profile, hop_trace[i].explored_vertices);
+            profile << ",\"eq_before\":";
+            append_json_neighbors(profile, hop_trace[i].eq_before);
+            profile << ",\"eq_after\":";
+            append_json_neighbors(profile, hop_trace[i].eq_after);
+            profile << ",\"aq_before\":";
+            append_json_neighbors(profile, hop_trace[i].aq_before);
+            profile << ",\"aq_after\":";
+            append_json_neighbors(profile, hop_trace[i].aq_after);
+            profile << ",\"recomputed_nodes\":";
+            append_json_uint32_array(profile, hop_trace[i].recomputed_nodes);
+            profile << "}";
         }
         profile << "],\"recomputed_nodes\":[";
         size_t recomputed_idx = 0;
