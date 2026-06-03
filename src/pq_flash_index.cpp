@@ -72,6 +72,9 @@ struct DiskannHopTraceEvent
     std::vector<Neighbor> aq_before;
     std::vector<Neighbor> aq_after;
     std::vector<uint32_t> recomputed_nodes;
+    uint64_t pq_distance_computed_nodes = 0;
+    uint64_t exact_distance_computed_nodes = 0;
+    uint64_t selected_candidate_nodes = 0;
 };
 
 struct DiskannZmqFetchProfile
@@ -2208,6 +2211,10 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
         // Compute distances using PQ directly instead of compute_dists
         diskann::aggregate_coords(node_nbrs, nnbrs, this->data, this->_n_chunks, pq_coord_scratch);
         diskann::pq_dist_lookup(pq_coord_scratch, nnbrs, this->_n_chunks, pq_dists, dists_out);
+        if (trace_enabled && active_hop_trace != nullptr)
+        {
+            active_hop_trace->pq_distance_computed_nodes += nnbrs;
+        }
 
         if (trace_enabled && active_hop_trace != nullptr)
         {
@@ -2412,6 +2419,8 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
         profile_candidate_events_total += nnbrs;
         if (trace_enabled && selected_for_recompute && active_hop_trace != nullptr)
         {
+            active_hop_trace->exact_distance_computed_nodes += nnbrs;
+            active_hop_trace->selected_candidate_nodes += nnbrs;
             const size_t remaining =
                 trace_limit > active_hop_trace->recomputed_nodes.size()
                     ? trace_limit - active_hop_trace->recomputed_nodes.size()
@@ -2687,6 +2696,10 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
             // compute node_nbrs <-> query dists in PQ space
             cpu_timer.reset();
             compute_dists(node_nbrs, nnbrs, dist_scratch);
+            if (!recompute_beighbor_embeddings && trace_enabled && active_hop_trace != nullptr)
+            {
+                active_hop_trace->pq_distance_computed_nodes += nnbrs;
+            }
             auto pq_elapsed = (float)cpu_timer.elapsed();
             profile_traversal_pq_distance_us += pq_elapsed;
             record_candidate_trace(hops, static_cast<int64_t>(node_id), node_nbrs, nnbrs, dist_scratch,
@@ -2894,6 +2907,10 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                 prune_node_nbrs(node_nbrs, nnbrs);
                 profile_traversal_prune_us += (float)prune_timer.elapsed();
                 compute_dists(node_nbrs, nnbrs, dist_scratch);
+                if (!recompute_beighbor_embeddings && trace_enabled && active_hop_trace != nullptr)
+                {
+                    active_hop_trace->pq_distance_computed_nodes += nnbrs;
+                }
                 auto pq_elapsed = (float)cpu_timer.elapsed();
                 profile_traversal_pq_distance_us += pq_elapsed;
                 record_candidate_trace(hops, static_cast<int64_t>(node_id), node_nbrs, nnbrs, dist_scratch,
@@ -2953,6 +2970,10 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
 
             cpu_timer.reset();
             compute_dists(batched_data_ptr, nnbrs, batched_dists); // Compute dists for the pruned set
+            if (!recompute_beighbor_embeddings && trace_enabled && active_hop_trace != nullptr)
+            {
+                active_hop_trace->pq_distance_computed_nodes += nnbrs;
+            }
             profile_traversal_pq_distance_us += (float)cpu_timer.elapsed();
             record_candidate_trace(hops, -1, batched_data_ptr, nnbrs, batched_dists, recompute_beighbor_embeddings);
             // ! Not sure if dist_scratch has enough space
@@ -3298,8 +3319,21 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
         profile << "\"candidate_trace_events_total\":" << profile_candidate_events_total << ",";
         profile << "\"candidate_trace_events_recorded\":" << profile_candidate_events_recorded << ",";
         profile << "\"candidate_trace_truncated\":" << (profile_candidate_events_total > profile_candidate_events_recorded ? "true" : "false") << ",";
+        uint64_t profile_traversal_pq_distance_nodes = 0;
+        uint64_t profile_traversal_exact_distance_nodes = 0;
+        uint64_t profile_traversal_selected_candidate_nodes = 0;
+        for (const auto &hop_event : hop_trace)
+        {
+            profile_traversal_pq_distance_nodes += hop_event.pq_distance_computed_nodes;
+            profile_traversal_exact_distance_nodes += hop_event.exact_distance_computed_nodes;
+            profile_traversal_selected_candidate_nodes += hop_event.selected_candidate_nodes;
+        }
+        profile << "\"traversal_pq_distance_computed_nodes\":" << profile_traversal_pq_distance_nodes << ",";
+        profile << "\"traversal_exact_distance_computed_nodes\":" << profile_traversal_exact_distance_nodes << ",";
+        profile << "\"traversal_selected_candidate_nodes\":" << profile_traversal_selected_candidate_nodes << ",";
         profile << "\"recompute_requested_nodes_total\":" << profile_recompute_nodes << ",";
         profile << "\"recompute_requested_nodes_unique\":" << profile_exact_by_node.size() << ",";
+        profile << "\"deferred_exact_distance_computed_nodes\":" << profile_exact_by_node.size() << ",";
         profile << "\"recompute_batches\":" << profile_recompute_batches << ",";
         profile << "\"deferred_fetch_ms\":" << (profile_deferred_fetch_us / 1000.0f) << ",";
         profile << "\"deferred_zmq_total_ms\":" << (profile_deferred_zmq.total_us / 1000.0f) << ",";
@@ -3333,6 +3367,9 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
             append_json_neighbors(profile, hop_trace[i].aq_after);
             profile << ",\"recomputed_nodes\":";
             append_json_uint32_array(profile, hop_trace[i].recomputed_nodes);
+            profile << ",\"pq_distance_computed_nodes\":" << hop_trace[i].pq_distance_computed_nodes;
+            profile << ",\"exact_distance_computed_nodes\":" << hop_trace[i].exact_distance_computed_nodes;
+            profile << ",\"selected_candidate_nodes\":" << hop_trace[i].selected_candidate_nodes;
             profile << "}";
         }
         profile << "],\"recomputed_nodes\":[";
